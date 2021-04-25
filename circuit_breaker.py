@@ -1,5 +1,5 @@
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 
 import redis
@@ -30,7 +30,7 @@ class CircuitBreaker:
             self.state = State(int(current_state['state']))
             self.failure_count = int(current_state['failure_count'])
             self.success_count = int(current_state['success_count'])
-            self.next_attempt = datetime.strptime(current_state['next_attempt'], "%Y-%m-%d'T'%H:%M:%S")
+            self.timestamp = datetime.strptime(current_state['timestamp'], "%Y-%m-%d'T'%H:%M:%S")
         else:
             self.__create()
 
@@ -38,14 +38,11 @@ class CircuitBreaker:
         self.state = State.CLOSED
         self.failure_count = 0
         self.success_count = 0
-        self.next_attempt = datetime.now()
+        self.timestamp = datetime.now()
 
     def try_acquire_permission(self):
         if self.state == State.OPEN:
-            if self.next_attempt <= datetime.now():
-                self.half()
-            else:
-                raise RuntimeError('Circuit Breaker State OPEN')
+            raise RuntimeError('Circuit Breaker State OPEN')
 
     def close(self):
         self.success_count = 0
@@ -54,54 +51,42 @@ class CircuitBreaker:
 
     def open(self):
         self.state = State.OPEN
-        self.next_attempt = datetime.now() + timedelta(milliseconds=self.options['wait_duration_open_state'])
-
-    def half(self):
-        self.state = State.HALF_OPEN
+        self.timestamp = datetime.now()
 
     def success(self):
         action = 'SUCCESS'
-        self.__increment_success()
 
-        if self.state == State.HALF_OPEN:
-            if self.success_count > self.options['success_rate_threshold_half_open']:
-                self.close()
-                action = 'RESET_SUCCESS'
         self.failure_count = 0
+        self.__increment_success()
         self.update_state(action)
 
     def fail(self):
-        self.__increment_failure()
         if self.failure_count >= self.options['failure_rate_threshold']:
+            if self.state == State.CLOSED:
+                self.__set_expire()
             self.open()
-        self.success_count = 0
+            self.success_count = 0
+
+        self.__increment_failure()
         self.update_state('FAILURE')
 
     def update_state(self, action):
+        state = {}
+
         if action == 'SUCCESS':
             state = {
                 'state': self.state.value,
                 'failure_count': self.failure_count,
-                'next_attempt': self.next_attempt.strftime("%Y-%m-%d'T'%H:%M:%S")
+                'timestamp': self.timestamp.strftime("%Y-%m-%d'T'%H:%M:%S")
             }
-            self.__set_state(state)
-        if action == 'RESET_SUCCESS':
-            state = {
-                'state': self.state.value,
-                'failure_count': self.failure_count,
-                'success_count': self.success_count,
-                'next_attempt': self.next_attempt.strftime("%Y-%m-%d'T'%H:%M:%S")
-            }
-            self.__set_state(state)
         elif action == 'FAILURE':
             state = {
                 'state': self.state.value,
                 'success_count': self.success_count,
-                'next_attempt': self.next_attempt.strftime("%Y-%m-%d'T'%H:%M:%S")
+                'timestamp': self.timestamp.strftime("%Y-%m-%d'T'%H:%M:%S")
             }
-            self.__set_state(state)
-            if self.failure_count == 1:
-                self.__set_expire(state)
+
+        self.__set_state(state)
 
     def __get_state(self):
         return redis_client.hgetall(f'{HASH_KEY}:{self.key}')
@@ -109,8 +94,8 @@ class CircuitBreaker:
     def __set_state(self, state):
         return redis_client.hmset(f'{HASH_KEY}:{self.key}', state)
 
-    def __set_expire(self, state):
-        return redis_client.expire(f'{HASH_KEY}:{self.key}', 50)
+    def __set_expire(self):
+        return redis_client.expire(f'{HASH_KEY}:{self.key}', 20)
 
     def __increment_success(self):
         with self._lock:

@@ -7,7 +7,7 @@ def lambda_handler(event, context):
     cb = CircuitBreaker(key)
 
     try:
-        for i in range(90):
+        for i in range(40):
             cb.try_acquire_permission()
             cb.fail()
 
