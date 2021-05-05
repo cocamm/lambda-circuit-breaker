@@ -1,9 +1,10 @@
-import lambda_function
+import lambda_function_cbbreaker
+import lambda_function_pybreaker
 
 
 def test():
     event = {'key': 'key'}
-    lambda_function.lambda_handler(event, None)
+    lambda_function_cbbreaker.lambda_handler(event, None)
 
 if __name__ == '__main__':
     test()
