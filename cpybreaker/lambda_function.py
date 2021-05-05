@@ -1,3 +1,4 @@
+import logging
 import os
 from datetime import datetime
 from random import randint
@@ -6,13 +7,19 @@ from time import sleep
 import numpy as np
 import redis
 
-from cpybreaker import circuit_breaker
-from cpybreaker.circuit_breaker import WindowType
+from cpybreaker.aggregator.circuit_breaker_aggregator import WindowType
+from cpybreaker.circuit_breaker import CircuitBreaker
+from cpybreaker.circuit_breaker_state import STATE_CLOSED
+from cpybreaker.storage.circuit_breaker_redis_storage import CircuitRedisStorage
 
-redis_client = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'), port=os.getenv('REDIS_PORT', 6379),
+
+logging.basicConfig(level=logging.INFO)
+
+redis_client = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'),
+                           port=os.getenv('REDIS_PORT', 6379),
                            decode_responses=True)
 
-DICT_VAR = {'SUCCESS': 30, 'FAIL': 70}
+DICT_VAR = {'SUCCESS': 20, 'FAIL': 80}
 DICT_VAR2 = {'SUCCESS': 90, 'FAIL': 10}
 keys, weights = zip(*DICT_VAR.items())
 probs = np.array(weights, dtype=float) / float(sum(weights))
@@ -25,7 +32,7 @@ def get_redis_connection(param):
 def lambda_handler(event, context):
     key = event['key']
 
-    random_states = np.random.choice(keys, 100, p=probs)
+    random_states = np.random.choice(keys, 600, p=probs)
     states = [str(val) for val in random_states]
     # cb = circuit_breaker.CircuitBreaker(
     #     fail_rate_threshold=50,
@@ -33,17 +40,19 @@ def lambda_handler(event, context):
     #     minimum_number_of_calls=10,
     #     window_type=WindowType.COUNTER,
     #     state_storage=circuit_breaker.CircuitMemoryStorage(circuit_breaker.STATE_CLOSED))
-    cb = circuit_breaker.CircuitBreaker(
+    cb = CircuitBreaker(
         fail_rate_threshold=50,
-        reset_timeout=3,
-        minimum_number_of_calls=10,
-        window_type=WindowType.COUNTER,
-        state_storage=circuit_breaker.CircuitRedisStorage(circuit_breaker.STATE_CLOSED, get_redis_connection('default'),
-                                                          namespace=key))
+        reset_timeout=5,
+        minimum_number_of_calls=100,
+        window_size=30,
+        window_type=WindowType.TIMER,
+        state_storage=CircuitRedisStorage(STATE_CLOSED,
+                                          get_redis_connection('default'),
+                                          namespace=key))
     for s in states:
         try:
-            sleep(randint(1, 500) / 1000)
-
+            sleep(randint(100, 400) / 1000)
+            print(f'{datetime.now()} CHAMANDO')
             cb.call(proccess_state, s)
         except Exception as e:
 

@@ -1,3 +1,10 @@
+import logging
+
+from cpybreaker.circuit_breaker import HAS_REDIS_SUPPORT
+from cpybreaker.circuit_breaker_state import STATE_CLOSED
+from cpybreaker.storage.circuit_breaker_storage import CircuitBreakerStorage
+
+
 class CircuitRedisStorage(CircuitBreakerStorage):
     """
     Implements a `CircuitBreakerStorage` using redis.

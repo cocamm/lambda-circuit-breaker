@@ -1,8 +1,12 @@
 import logging
 import time
 import uuid
+import calendar
+from datetime import datetime
 
-from cpybreaker.circuit_breaker import CircuitBreakerStorage, STATE_CLOSED
+from cpybreaker.circuit_breaker import HAS_REDIS_SUPPORT
+from cpybreaker.circuit_breaker_state import STATE_CLOSED
+from cpybreaker.storage.circuit_breaker_storage import CircuitBreakerStorage
 
 
 class CircuitRedisStorage(CircuitBreakerStorage):
@@ -45,8 +49,8 @@ class CircuitRedisStorage(CircuitBreakerStorage):
         self._initialize_redis_state(self._initial_state)
 
     def _initialize_redis_state(self, state):
-        self._redis.setnx(self._namespace('counter'), 0)
-        self._redis.setnx(self._namespace('fail_counter'), 0)
+        # self._redis.setnx(self._namespace('counter'), 0)
+        # self._redis.setnx(self._namespace('fail_counter'), 0)
         self._redis.setnx(self._namespace('state'), state)
 
     @property
@@ -91,7 +95,7 @@ class CircuitRedisStorage(CircuitBreakerStorage):
         Increases the failure counter by one.
         """
         try:
-            self._redis.zadd(self._namespace('counter'), {uuid.uuid4().bytes: time.time()})
+            self._redis.incr(self._namespace('counter'))
         except self.RedisError:
             self.logger.error('RedisError', exc_info=True)
             pass
@@ -102,6 +106,28 @@ class CircuitRedisStorage(CircuitBreakerStorage):
         """
         try:
             self._redis.incr(self._namespace('fail_counter'))
+        except self.RedisError:
+            self.logger.error('RedisError', exc_info=True)
+            pass
+
+    def increment_counter_timer(self, time):
+        """
+        Increases the counter by one.
+        """
+        try:
+            self._redis.zadd(self._namespace('counter-timer'),
+                             {str(uuid.uuid4()): int(time)})
+        except self.RedisError:
+            self.logger.error('RedisError', exc_info=True)
+            pass
+
+    def increment_fail_counter_timer(self, time):
+        """
+        Increases the failure counter by one.
+        """
+        try:
+            self._redis.zadd(self._namespace('fail_counter-timer'),
+                             {uuid.uuid4().bytes: int(time)})
         except self.RedisError:
             self.logger.error('RedisError', exc_info=True)
             pass
@@ -134,6 +160,8 @@ class CircuitRedisStorage(CircuitBreakerStorage):
             pipe = self._redis.pipeline()
             pipe.set(self._namespace('counter'), 0)
             pipe.set(self._namespace('fail_counter'), 0)
+            pipe.zremrangebyscore(self._namespace('counter-timer'), "-inf", "+inf")
+            pipe.zremrangebyscore(self._namespace('fail_counter-timer'), "-inf", "+inf")
             pipe.execute()
         except self.RedisError:
             self.logger.error('RedisError', exc_info=True)
@@ -160,8 +188,48 @@ class CircuitRedisStorage(CircuitBreakerStorage):
         Returns the current value of the failure counter.
         """
         try:
-            value = self._redis.zcard(self._namespace('fail_counter'))
+            value = self._redis.get(self._namespace('fail_counter'))
             if value:
+                return int(value)
+            else:
+                return 0
+        except self.RedisError:
+            self.logger.error('RedisError: Assuming no errors', exc_info=True)
+            return 0
+
+    def get_counter_timer(self, time, window_size):
+        """
+        Returns the current value of the failure counter.
+        """
+        try:
+            key = self._namespace('counter-timer')
+            p = self._redis.pipeline()
+            p.zremrangebyscore(key, "-inf", int(time) - window_size)
+            p.zcard(key)
+            result = p.execute()
+            value = result.pop()
+            if value:
+                self.logger.info(f'counter_value={value}')
+                return int(value)
+            else:
+                return 0
+        except self.RedisError:
+            self.logger.error('RedisError: Assuming no errors', exc_info=True)
+            return 0
+
+    def get_fail_counter_timer(self, time, window_size):
+        """
+        Returns the current value of the failure counter.
+        """
+        try:
+            key = self._namespace('fail_counter-timer')
+            p = self._redis.pipeline()
+            p.zremrangebyscore(key, "-inf", int(time) - window_size)
+            p.zcard(key)
+            result = p.execute()
+            value = result.pop()
+            if value:
+                self.logger.info(f'fail_counter_value={value}')
                 return int(value)
             else:
                 return 0
