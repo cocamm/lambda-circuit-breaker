@@ -1,162 +1,390 @@
-import logging
-import os
 import threading
 from datetime import datetime
 from enum import Enum
+from functools import wraps
 
-import redis
+from aggregator.circuit_breaker_aggregator import WindowType
+from circuit_breaker_state import STATE_CLOSED, CircuitClosedState, \
+    CircuitOpenState, CircuitHalfOpenState, STATE_HALF_OPEN, STATE_OPEN
+from storage.circuit_breaker_memory_storage import CircuitMemoryStorage
 
-HASH_KEY = 'circuitbreaker'
-STATE_KEY = 'state'
-AGGREGATOR_KEY = 'window_aggregator'
-DEFAULTS = {
-    'failure_rate_threshold': 50,
-    'sliding_window_size': 15,
-    'minimum_number_of_calls': 20,
-    'wait_duration_open_state': 20
-}
+try:
+    from tornado import gen
 
-redis_client = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'), port=os.getenv('REDIS_PORT', 6379),
-                           decode_responses=True)
+    HAS_TORNADO_SUPPORT = True
+except ImportError:
+    HAS_TORNADO_SUPPORT = False
+
+try:
+    from redis.exceptions import RedisError
+
+    HAS_REDIS_SUPPORT = True
+except ImportError:
+    HAS_REDIS_SUPPORT = False
 
 
-class CircuitBreaker:
+class CircuitBreaker(object):
 
-    def __init__(self, key, options=None):
-        if options is None:
-            options = DEFAULTS
-        self.key = key
-        self.options = options
-        self._lock = threading.Lock()
+    def __init__(self, fail_rate_threshold=70, reset_timeout=60,
+                 minimum_number_of_calls=100, window_size=60,
+                 number_of_calls_half_open=10, window_type=WindowType.COUNTER,
+                 exclude=None, listeners=None, state_storage=None, name=None):
+        """
+        Creates a new circuit breaker with the given parameters.
+        """
+        self._lock = threading.RLock()
 
-        current_state = self.__get_state()
-        if current_state:
-            self.state = State(int(current_state.get('state', State.CLOSED.value)))
-            self.failure_count = int(current_state.get('failure_count', 0))
-            self.success_count = int(current_state.get('success_count', 0))
-            self.timestamp = datetime.now() if 'timestamp' not in current_state else datetime.strptime(
-                current_state['timestamp'], "%Y-%m-%d'T'%H:%M:%S")
-        else:
-            self.__create()
+        self._fail_rate_threshold = fail_rate_threshold
+        self._reset_timeout = reset_timeout
+        self._minimum_number_of_calls = minimum_number_of_calls
+        self._number_of_calls_half_open = number_of_calls_half_open
+        self._window_size = window_size
+        self._window_type = window_type
 
-        logging.debug(f'state={self.state} failure_count={self.failure_count} success_count={self.success_count}')
+        self._state_storage = state_storage or CircuitMemoryStorage(
+            STATE_CLOSED)
+        self._state = self._create_new_state(self.current_state)
 
-    def __create(self):
-        self.close()
+        self._excluded_exceptions = list(exclude or [])
+        self._listeners = list(listeners or [])
+        self._name = name
 
-    def try_acquire_permission(self):
-        if self.state == State.OPEN:
-            raise RuntimeError('Circuit Breaker State OPEN')
+    @property
+    def counter(self):
+        """
+        Returns the current number of consecutive failures.
+        """
+        return self._state_storage.counter
 
-    def close(self):
-        self.success_count = 0
-        self.failure_count = 0
-        self.state = State.CLOSED
-        self.timestamp = datetime.now()
+    @property
+    def fail_counter(self):
+        """
+        Returns the current number of consecutive failures.
+        """
+        return self._state_storage.fail_counter
+
+    def get_counter_timer(self, time, window_size):
+        """
+        Returns the current number of consecutive failures.
+        """
+        return self._state_storage.get_counter_timer(time, window_size)
+
+    def get_fail_counter_timer(self, time, window_size):
+        """
+        Returns the current number of consecutive failures.
+        """
+        return self._state_storage.get_fail_counter_timer(time, window_size)
+
+    @property
+    def fail_rate_threshold(self):
+        """
+        Returns the maximum number of failures tolerated before the circuit is
+        opened.
+        """
+        return self._fail_rate_threshold
+
+    @fail_rate_threshold.setter
+    def fail_rate_threshold(self, number):
+        """
+        Sets the maximum `number` of failures tolerated before the circuit is
+        opened.
+        """
+        self._fail_rate_threshold = number
+
+    @property
+    def reset_timeout(self):
+        """
+        Once this circuit breaker is opened, it should remain opened until the
+        timeout period, in seconds, elapses.
+        """
+        return self._reset_timeout
+
+    @reset_timeout.setter
+    def reset_timeout(self, timeout):
+        """
+        Sets the `timeout` period, in seconds, this circuit breaker should be
+        kept open.
+        """
+        self._reset_timeout = timeout
+
+    @property
+    def minimum_number_of_calls(self):
+        """
+        The minimum number of calls needed to circuit breaker take an action.
+        """
+        return self._minimum_number_of_calls
+
+    @property
+    def number_of_calls_half_open(self):
+        """
+        The number of permitted calls in half_open state.
+        """
+        return self._number_of_calls_half_open
+
+    # @minimum_number_of_calls.setter
+    # def minimum_number_of_calls(self, number):
+    #     """
+    #     Sets the minimum number of calls that the circuit breaker should use to
+    #     process the state.
+    #     """
+    #     self._minimum_number_of_calls = number
+
+    @property
+    def window_size(self):
+        """
+        The window size to aggregate the failure and success count of calls
+        """
+        return self._window_size
+
+    # @window_size.setter
+    # def window_size(self, size):
+    #     """
+    #     Sets the window size to aggregate the results of calls.
+    #     """
+    #     self._window_size = size
+
+    @property
+    def window_type(self):
+        """
+        The window type to calculate the state of circuit breaker
+        """
+        return self._window_type
+
+    def _create_new_state(self, new_state, prev_state=None, notify=False):
+        """
+        Return state object from state string, i.e.,
+        'closed' -> <CircuitClosedState>
+        """
+        state_map = {
+            STATE_CLOSED: CircuitClosedState,
+            STATE_OPEN: CircuitOpenState,
+            STATE_HALF_OPEN: CircuitHalfOpenState,
+        }
+        try:
+            cls = state_map[new_state]
+            return cls(self, prev_state=prev_state, notify=notify)
+        except KeyError:
+            msg = "Unknown state {!r}, valid states: {}"
+            raise ValueError(msg.format(new_state, ', '.join(state_map)))
+
+    @property
+    def state(self):
+        """
+        Update (if needed) and returns the cached state object.
+        """
+        # Ensure cached state is up-to-date
+        if self.current_state != self._state.name:
+            # If cached state is out-of-date, that means that it was likely
+            # changed elsewhere (e.g. another process instance). We still send
+            # out a notification, informing others that this particular circuit
+            # breaker instance noticed the changed circuit.
+            self.state = self.current_state
+        return self._state
+
+    @state.setter
+    def state(self, state_str):
+        """
+        Set cached state and notify listeners of newly cached state.
+        """
+        with self._lock:
+            self._state = self._create_new_state(
+                state_str, prev_state=self._state, notify=True)
+
+    @property
+    def current_state(self):
+        """
+        Returns a string that identifies the state of the circuit breaker as
+        reported by the _state_storage. i.e., 'closed', 'open', 'half-open'.
+        """
+        return self._state_storage.state
+
+    @property
+    def excluded_exceptions(self):
+        """
+        Returns the list of excluded exceptions, e.g., exceptions that should
+        not be considered system errors by this circuit breaker.
+        """
+        return tuple(self._excluded_exceptions)
+
+    def add_excluded_exception(self, exception):
+        """
+        Adds an exception to the list of excluded exceptions.
+        """
+        with self._lock:
+            self._excluded_exceptions.append(exception)
+
+    def add_excluded_exceptions(self, *exceptions):
+        """
+        Adds exceptions to the list of excluded exceptions.
+        """
+        for exc in exceptions:
+            self.add_excluded_exception(exc)
+
+    def remove_excluded_exception(self, exception):
+        """
+        Removes an exception from the list of excluded exceptions.
+        """
+        with self._lock:
+            self._excluded_exceptions.remove(exception)
+
+    def _inc_counter(self):
+        """
+        Increments the counter of failed calls.
+        """
+        self._state_storage.increment_counter()
+
+    def _inc_counter_timer(self, time):
+        """
+        Increments the counter of failed calls.
+        """
+        self._state_storage.increment_counter_timer(time)
+
+    def _inc_fail_counter(self):
+        """
+        Increments the counter of failed calls.
+        """
+        self._state_storage.increment_fail_counter()
+
+    def _inc_fail_counter_timer(self, time):
+        """
+        Increments the counter of failed calls.
+        """
+        self._state_storage.increment_fail_counter_timer(time)
+
+    def is_system_error(self, exception):
+        """
+        Returns whether the exception `exception` is considered a signal of
+        system malfunction. Business exceptions should not cause this circuit
+        breaker to open.
+        """
+        exception_type = type(exception)
+        for exclusion in self._excluded_exceptions:
+            if type(exclusion) is type:
+                if issubclass(exception_type, exclusion):
+                    return False
+            elif callable(exclusion):
+                if exclusion(exception):
+                    return False
+        return True
+
+    def call(self, func, *args, **kwargs):
+        """
+        Calls `func` with the given `args` and `kwargs` according to the rules
+        implemented by the current state of this circuit breaker.
+        """
+        with self._lock:
+            return self.state.call(func, *args, **kwargs)
+
+    def call_async(self, func, *args, **kwargs):
+        """
+        Calls async `func` with the given `args` and `kwargs` according to the rules
+        implemented by the current state of this circuit breaker.
+
+        Return a closure to prevent import errors when using without tornado present
+        """
+
+        @gen.coroutine
+        def wrapped():
+            with self._lock:
+                ret = yield self.state.call_async(func, *args, **kwargs)
+                raise gen.Return(ret)
+
+        return wrapped()
 
     def open(self):
-        self.state = State.OPEN
-        self.timestamp = datetime.now()
-
-    def success(self):
-        self.__increment_success()
-        if self.state != State.CLOSED:
-            self.__set_error_aggregator(round(datetime.now().timestamp()), 'success_count')
-
-    def fail(self):
-        expire_at = None
-
-        self.__increment_failure()
-        self.__set_error_aggregator(round(datetime.now().timestamp()), 'failure_count')
-
-        total_count = self.failure_count + self.success_count
-        logging.debug(f'total_count={total_count}')
-
-        if total_count > self.options['minimum_number_of_calls']:
-            if self.__get_failure_threshold(total_count) >= self.options['failure_rate_threshold']:
-                if self.state == State.CLOSED:
-                    expire_at = self.options['wait_duration_open_state']
-                    self.__remove_aggregators()
-
-                logging.debug(f'Change status from {self.state} to OPEN')
-                self.open()
-
-            self.update_state(ex=expire_at)
-
-    def update_state(self, ex=None):
-        state = {
-            'state': self.state.value,
-            'timestamp': self.timestamp.strftime("%Y-%m-%d'T'%H:%M:%S")
-        }
-        self.__set_state(state)
-
-        if ex is not None:
-            self.__set_expire(ex)
-
-    def __set_expire(self, ex):
-        redis_client.expire(f'{HASH_KEY}:{self.key}:{STATE_KEY}', self.options['wait_duration_open_state'])
-
-    def __get_state(self):
-        state = redis_client.hgetall(f'{HASH_KEY}:{self.key}:{STATE_KEY}')
-
-        keys = redis_client.keys(f'{HASH_KEY}:{self.key}:{AGGREGATOR_KEY}:*')
-        logging.debug(f'keys={keys}')
-        if keys is None:
-            return
-
-        pipe = redis_client.pipeline()
-        for k in keys:
-            pipe.hgetall(k)
-        window_aggregators = pipe.execute()
-        logging.debug(f'window_aggregators={window_aggregators}')
-
-        if len(window_aggregators) > 0:
-            state.update({'failure_count': 0, 'success_count': 0})
-            for w in window_aggregators:
-                state['failure_count'] += int(w.get('failure_count', 0))
-                state['success_count'] += int(w.get('success_count', 0))
-
-        logging.debug(f'state={state}')
-        return state
-
-    def __set_state(self, state):
-        return redis_client.hmset(f'{HASH_KEY}:{self.key}:{STATE_KEY}', state)
-
-    def __increment_success(self):
+        """
+        Opens the circuit, e.g., the following calls will immediately fail
+        until timeout elapses.
+        """
         with self._lock:
-            self.success_count += 1
+            self.state = self._state_storage.state = STATE_OPEN
+            self._state_storage.opened_at = datetime.utcnow()
 
-    def __increment_failure(self):
+    def half_open(self):
+        """
+        Half-opens the circuit, e.g. lets the following call pass through and
+        opens the circuit if the call fails (or closes the circuit if the call
+        succeeds).
+        """
         with self._lock:
-            self.failure_count += 1
+            self.state = self._state_storage.state = STATE_HALF_OPEN
 
-    def __get_failure_threshold(self, total_count):
-        failure_threshold = (self.failure_count * 100 / total_count)
-        logging.debug(f'failure_threshold={failure_threshold}')
+    def close(self):
+        """
+        Closes the circuit, e.g. lets the following calls execute as usual.
+        """
+        with self._lock:
+            self.state = self._state_storage.state = STATE_CLOSED
 
-        return failure_threshold
+    def __call__(self, *call_args, **call_kwargs):
+        """
+        Returns a wrapper that calls the function `func` according to the rules
+        implemented by the current state of this circuit breaker.
 
-    def __set_error_aggregator(self, aggregator_key, window_aggregator):
-        result = redis_client.hincrby(f'{HASH_KEY}:{self.key}:{AGGREGATOR_KEY}:{aggregator_key}', window_aggregator, 1)
-        if result == 1:
-            redis_client.expire(f'{HASH_KEY}:{self.key}:{AGGREGATOR_KEY}:{aggregator_key}',
-                                self.options['sliding_window_size'])
-        return result
+        Optionally takes the keyword argument `__pybreaker_call_coroutine`,
+        which will will call `func` as a Tornado co-routine.
+        """
+        call_async = call_kwargs.pop('__pybreaker_call_async', False)
 
-    def __remove_aggregators(self):
-        keys = redis_client.keys(f'{HASH_KEY}:{self.key}:{AGGREGATOR_KEY}:*')
-        if keys is None:
-            return
-        pipe = redis_client.pipeline()
+        if call_async and not HAS_TORNADO_SUPPORT:
+            raise ImportError('No module named tornado')
 
-        for k in keys:
-            pipe.delete(k)
-        pipe.execute()
+        def _outer_wrapper(func):
+            @wraps(func)
+            def _inner_wrapper(*args, **kwargs):
+                if call_async:
+                    return self.call_async(func, *args, **kwargs)
+                return self.call(func, *args, **kwargs)
 
-        logging.info('Aggregators deleted...')
+            return _inner_wrapper
+
+        if call_args:
+            return _outer_wrapper(*call_args)
+        return _outer_wrapper
+
+    @property
+    def listeners(self):
+        """
+        Returns the registered listeners as a tuple.
+        """
+        return tuple(self._listeners)
+
+    def add_listener(self, listener):
+        """
+        Registers a listener for this circuit breaker.
+        """
+        with self._lock:
+            self._listeners.append(listener)
+
+    def add_listeners(self, *listeners):
+        """
+        Registers listeners for this circuit breaker.
+        """
+        for listener in listeners:
+            self.add_listener(listener)
+
+    def remove_listener(self, listener):
+        """
+        Unregisters a listener of this circuit breaker.
+        """
+        with self._lock:
+            self._listeners.remove(listener)
+
+    @property
+    def name(self):
+        """
+        Returns the name of this circuit breaker. Useful for logging.
+        """
+        return self._name
+
+    @name.setter
+    def name(self, name):
+        """
+        Set the name of this circuit breaker.
+        """
+        self._name = name
 
 
-class State(Enum):
-    CLOSED = 1
-    OPEN = 2
-    HALF_OPEN = 3
+class ResultType(Enum):
+    SUCCESS = "success",
+    ERROR = "error"

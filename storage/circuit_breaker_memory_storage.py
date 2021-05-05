@@ -1,4 +1,4 @@
-from cpybreaker.storage.circuit_breaker_storage import CircuitBreakerStorage
+from storage.circuit_breaker_storage import CircuitBreakerStorage
 
 
 class CircuitMemoryStorage(CircuitBreakerStorage):

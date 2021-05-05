@@ -4,9 +4,9 @@ import uuid
 import calendar
 from datetime import datetime
 
-from cpybreaker.circuit_breaker import HAS_REDIS_SUPPORT
-from cpybreaker.circuit_breaker_state import STATE_CLOSED
-from cpybreaker.storage.circuit_breaker_storage import CircuitBreakerStorage
+from circuit_breaker import HAS_REDIS_SUPPORT
+from circuit_breaker_state import STATE_CLOSED
+from storage.circuit_breaker_storage import CircuitBreakerStorage
 
 
 class CircuitRedisStorage(CircuitBreakerStorage):

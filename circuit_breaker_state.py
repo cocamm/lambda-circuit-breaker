@@ -5,9 +5,9 @@ from datetime import datetime, timedelta
 import gen as gen
 import six
 
-from cpybreaker.aggregator.circuit_breaker_aggregator import \
+from aggregator.circuit_breaker_aggregator import \
     CircuitBreakerCounterAggregator, CircuitBreakerTimerAggregator, WindowType
-from cpybreaker.aggregator.circuit_breaker_aggregator import \
+from aggregator.circuit_breaker_aggregator import \
     ResultType
 
 STATE_OPEN = 'open'
